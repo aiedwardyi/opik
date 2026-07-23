@@ -146,6 +146,7 @@ class OnlineScoringTraceThreadLlmAsJudgeScorerTest {
         // override these per-case.
         Mockito.lenient().when(onlineScoringConfig.getAgenticToolsCharsPerToken()).thenReturn(4);
         Mockito.lenient().when(onlineScoringConfig.getAgenticToolsThresholdTokens()).thenReturn(50_000);
+        Mockito.lenient().when(onlineScoringConfig.getAgenticToolsMaxPreloadBytes()).thenReturn(64L * 1024 * 1024);
 
         agenticScoringService = new AgenticScoringServiceImpl(onlineScoringConfig, toolRegistry);
 

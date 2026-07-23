@@ -25,6 +25,7 @@ import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.Logger;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import ru.vyarus.dropwizard.guice.module.yaml.bind.Config;
 
@@ -196,6 +197,35 @@ public interface AgenticScoringService {
      * <p>Same {@code charsPerToken} contract as {@link #estimateTraceContextTokens}.
      */
     int estimateThreadContextTokens(List<Trace> traces, List<Span> spans, int charsPerToken);
+
+    /**
+     * Streaming, heap-bounded preload of a thread's spans, used to drive the inline-vs-agentic-tools
+     * routing decision <em>without</em> materializing an unbounded thread into heap. Consumes
+     * {@code spanService.getByTraceIds(...)} as the {@link Flux} it already is, accumulating spans and
+     * their approximate serialized size; as soon as the running size would exceed {@code maxPreloadBytes}
+     * it cancels the upstream ClickHouse fetch and returns {@link ThreadSpanPreload#overflowed()} == true
+     * with an empty span list.
+     *
+     * <p>Replaces the previous {@code getByTraceIds(...).collectList()} in the trace-thread scorers, which
+     * buffered every span of every trace in the thread (GBs on large agentic threads) purely to size the
+     * routing decision — the heap-OOM crash-loop fixed here (OPIK-7454). On the agentic-tools path the
+     * buffer is never needed (the model re-fetches per-trace on demand via {@code read(type=trace)}), so
+     * overflow simply forces that path; below the cap the full — and therefore bounded — span list is
+     * returned for the inline/enriched path.
+     */
+    Mono<ThreadSpanPreload> preloadThreadSpansBounded(Flux<Span> spanFlux, long maxPreloadBytes);
+
+    /**
+     * Result of {@link #preloadThreadSpansBounded}. {@code spans} carries the buffered spans when the
+     * thread fit under the cap (inline/enriched path) and is empty when {@code overflowed} — the tools
+     * path needs no buffer. {@code approxBytes} is the accumulated approximate serialized size (span
+     * input + output + metadata) seen before stopping.
+     */
+    record ThreadSpanPreload(List<Span> spans, long approxBytes, boolean overflowed) {
+        public static ThreadSpanPreload empty() {
+            return new ThreadSpanPreload(List.of(), 0L, false);
+        }
+    }
 
     /**
      * Build a sanitized one-line description of the outgoing LLM request for user-facing logs. The full
@@ -453,6 +483,67 @@ class AgenticScoringServiceImpl implements AgenticScoringService {
         Preconditions.checkArgument(charsPerToken >= 1, "charsPerToken must be >= 1, got %s", charsPerToken);
         return JsonUtils.writeValueAsString(OnlineScoringEngine.fromTraceToThreadEnriched(traces, spans)).length()
                 / charsPerToken;
+    }
+
+    @Override
+    public Mono<ThreadSpanPreload> preloadThreadSpansBounded(@NonNull Flux<Span> spanFlux, long maxPreloadBytes) {
+        Preconditions.checkArgument(maxPreloadBytes >= 1, "maxPreloadBytes must be >= 1, got %s", maxPreloadBytes);
+        // Mono.defer → a fresh accumulator per subscription, so a retry/resubscribe of the (cold) span
+        // fetch never reuses stale buffered state. The accumulator is mutated inside takeUntil's predicate
+        // (invoked once per element, in order, on the onNext thread), and takeUntil cancels the upstream
+        // ClickHouse fetch as soon as a span pushes the running size over the cap — so the whole thread is
+        // never materialized. then(...) discards the streamed elements themselves; the accumulator already
+        // holds the ones we keep.
+        return Mono.defer(() -> {
+            var accumulator = new BoundedSpanAccumulator(maxPreloadBytes);
+            return spanFlux
+                    .takeUntil(accumulator::addAndCheckOverflow)
+                    .then(Mono.fromSupplier(accumulator::toPreload));
+        });
+    }
+
+    /**
+     * Mutable, single-subscription accumulator behind {@link #preloadThreadSpansBounded}. Not thread-safe
+     * by design — it is only ever touched from the sequential reactive onNext path of one subscription.
+     */
+    private static final class BoundedSpanAccumulator {
+        private final long maxPreloadBytes;
+        private final List<Span> spans = new ArrayList<>();
+        private long approxBytes = 0L;
+        private boolean overflowed = false;
+
+        private BoundedSpanAccumulator(long maxPreloadBytes) {
+            this.maxPreloadBytes = maxPreloadBytes;
+        }
+
+        /** @return true once THIS span pushes the running size over the cap (tells takeUntil to stop). */
+        private boolean addAndCheckOverflow(Span span) {
+            if (overflowed) {
+                return true;
+            }
+            approxBytes += approxSpanBytes(span);
+            if (approxBytes > maxPreloadBytes) {
+                overflowed = true;
+                spans.clear(); // drop the buffer — the tools path re-fetches per-trace on demand
+                return true;
+            }
+            spans.add(span);
+            return false;
+        }
+
+        private ThreadSpanPreload toPreload() {
+            return overflowed
+                    ? new ThreadSpanPreload(List.of(), approxBytes, true)
+                    : new ThreadSpanPreload(List.copyOf(spans), approxBytes, false);
+        }
+
+        private static long approxSpanBytes(Span span) {
+            return jsonLength(span.input()) + jsonLength(span.output()) + jsonLength(span.metadata());
+        }
+
+        private static long jsonLength(JsonNode node) {
+            return node == null || node.isNull() ? 0L : node.toString().length();
+        }
     }
 
     @Override

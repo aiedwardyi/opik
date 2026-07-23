@@ -220,26 +220,28 @@ public class OnlineScoringTraceThreadLlmAsJudgeScorer extends OnlineScoringBaseS
      */
     private Mono<Void> scoreThread(TraceThreadToScoreLlmAsJudge message, List<Trace> traces, UUID threadModelId,
             String threadId, AutomationRuleEvaluator<?, ?> rule, Map<String, String> mdc) {
-        // When the feature flag is on, fetch every span across every trace in the thread
-        // up front. We fetch BEFORE the inline-vs-tools path decision in prepareEvaluation
-        // (rather than only when the inline path wins) so estimateThreadContextTokens can
-        // serialize the enriched shape and route honestly — otherwise a thread with small
-        // trace bodies but huge spans would inline-render an oversized prompt. The cost is
-        // wasted I/O when the tools path ultimately wins: the prepared spans go unused on
-        // that path (which renders only the compact skeleton; the model uses ReadTool to
-        // re-fetch per-trace on demand). Acceptable trade-off — route correctness over a
-        // narrow over-fetch.
+        // When the feature flag is on, preload the thread's spans to size the inline-vs-tools routing
+        // decision — but STREAM them under a hard heap cap rather than buffering the whole thread. The
+        // preload consumes getByTraceIds as a Flux and stops (cancelling the ClickHouse fetch) the moment
+        // the accumulated span size crosses agenticToolsMaxPreloadBytes; past that point the thread is
+        // definitively over the routing threshold and takes the tools path, which renders only the compact
+        // skeleton and re-fetches per-trace on demand via ReadTool — so the buffer was never needed. Below
+        // the cap the full (bounded) span list flows through to the inline/enriched render. This replaces
+        // the previous getByTraceIds(...).collectList(), which materialized every span of every trace in
+        // heap (GBs on large agentic threads) purely to compute the size estimate, OOM-crashing the JVM
+        // (OPIK-7454).
         //
-        // When the flag is off, an empty list is passed through; the enriched serializer
-        // omits the `spans` field via @JsonInclude(NON_NULL), so the rendered JSON is
-        // byte-identical to today's [{role, content}, ...] shape.
-        Mono<List<Span>> spansMono = serviceTogglesConfig.isAgenticToolsEnabled()
-                ? spanService.getByTraceIds(traces.stream().map(Trace::id).collect(Collectors.toSet()))
-                        .collectList()
+        // When the flag is off, an empty preload is passed through; the enriched serializer omits the
+        // `spans` field via @JsonInclude(NON_NULL), so the rendered JSON is byte-identical to today's
+        // [{role, content}, ...] shape.
+        Mono<AgenticScoringService.ThreadSpanPreload> spansMono = serviceTogglesConfig.isAgenticToolsEnabled()
+                ? agenticScoringService.preloadThreadSpansBounded(
+                        spanService.getByTraceIds(traces.stream().map(Trace::id).collect(Collectors.toSet())),
+                        onlineScoringConfig.getAgenticToolsMaxPreloadBytes())
                         .contextWrite(ctx -> ctx
                                 .put(RequestContext.WORKSPACE_ID, message.workspaceId())
                                 .put(RequestContext.USER_NAME, message.userName()))
-                : Mono.just(List.of());
+                : Mono.just(AgenticScoringService.ThreadSpanPreload.empty());
         // Monitoring recorder (OPIK-6994): one hidden evaluator trace per thread evaluation, with an
         // llm span per LLM round and tool spans for the agentic loop. NOOP when the toggle is off.
         // Resolved reactively because the project-name lookup is blocking.
@@ -303,13 +305,19 @@ public class OnlineScoringTraceThreadLlmAsJudgeScorer extends OnlineScoringBaseS
      * the template must be text-only. Otherwise the inline path runs unchanged — same shape as today.
      */
     private Mono<List<FeedbackScoreBatchItemThread>> evaluate(TraceThreadToScoreLlmAsJudge message,
-            List<Trace> traces, List<Span> spans, boolean hasAttachments, UUID threadModelId, String threadId,
-            AutomationRuleEvaluator<?, ?> rule, Map<String, String> mdc, EvaluationRecorder recorder) {
+            List<Trace> traces, AgenticScoringService.ThreadSpanPreload preload, boolean hasAttachments,
+            UUID threadModelId, String threadId, AutomationRuleEvaluator<?, ?> rule, Map<String, String> mdc,
+            EvaluationRecorder recorder) {
+        // Empty when the toggle is off OR the bounded preload overflowed (thread too large — routes to
+        // tools, which needs no buffer). Non-empty (and bounded) only on the inline/enriched path.
+        List<Span> spans = preload.spans();
         // One guard per thread evaluation; UNLIMITED when the rule sets no maxCostUsd. Charges every
         // LLM call (initial + tool rounds + wrap-up) and tells the tool loop when to start wrapping up.
         var costGuard = BudgetGuard.create(message.code().maxCostUsd(), message.code().model().name(),
                 llmProviderFactory);
-        return Mono.fromCallable(() -> prepareEvaluation(message, traces, spans, hasAttachments, threadId, rule, mdc))
+        return Mono.fromCallable(
+                () -> prepareEvaluation(message, traces, spans, preload.overflowed(), hasAttachments, threadId, rule,
+                        mdc))
                 .subscribeOn(Schedulers.parallel())
                 .flatMap(prepared -> {
                     // Uniform structure with trace evals: prepare_evaluation span (fetched spans,
@@ -365,22 +373,27 @@ public class OnlineScoringTraceThreadLlmAsJudgeScorer extends OnlineScoringBaseS
      * rendering); no blocking I/O happens here.
      */
     private PreparedEvaluation prepareEvaluation(TraceThreadToScoreLlmAsJudge message, List<Trace> traces,
-            List<Span> spans, boolean hasAttachments, String threadId, AutomationRuleEvaluator<?, ?> rule,
-            Map<String, String> mdc) {
+            List<Span> spans, boolean preloadOverflowed, boolean hasAttachments, String threadId,
+            AutomationRuleEvaluator<?, ?> rule, Map<String, String> mdc) {
         try (var logContext = wrapWithMdc(mdc)) {
             userFacingLogger.info("Evaluating threadId '{}' sampled by rule '{}'", threadId, rule.getName());
 
             String modelName = message.code().model().name();
-            // Skip the JSON serialization that drives the token estimate when the toggle is off —
-            // we'd just throw the number away. shouldUseAgenticTools re-checks the toggle, so the
-            // estimate is only consulted on the agentic-tools path. When the toggle is on, `spans`
-            // is the pre-fetched per-thread span list (empty when toggle off) and is factored in so
-            // an enriched-context payload routes to tools when it's actually big — not when the
-            // trace bodies alone happen to be small.
-            int estimatedContextTokens = serviceTogglesConfig.isAgenticToolsEnabled()
-                    ? agenticScoringService.estimateThreadContextTokens(traces, spans,
-                            onlineScoringConfig.getAgenticToolsCharsPerToken())
-                    : 0;
+            // The bounded span preload already answered "is this thread oversized?". If it overflowed the
+            // heap cap it is by construction over the routing threshold, and `spans` is empty (the tools
+            // path re-fetches per-trace on demand) — force tools without serializing anything. Otherwise
+            // `spans` is the full (bounded) list, so the enriched-shape estimate is cheap and honest. When
+            // the toggle is off we skip the estimate entirely — the number would be thrown away, and
+            // shouldUseAgenticTools re-checks the toggle anyway.
+            int estimatedContextTokens;
+            if (!serviceTogglesConfig.isAgenticToolsEnabled()) {
+                estimatedContextTokens = 0;
+            } else if (preloadOverflowed) {
+                estimatedContextTokens = Integer.MAX_VALUE;
+            } else {
+                estimatedContextTokens = agenticScoringService.estimateThreadContextTokens(traces, spans,
+                        onlineScoringConfig.getAgenticToolsCharsPerToken());
+            }
             boolean useTools = shouldUseAgenticTools(estimatedContextTokens, hasAttachments, modelName,
                     threadId, message.code().messages());
 

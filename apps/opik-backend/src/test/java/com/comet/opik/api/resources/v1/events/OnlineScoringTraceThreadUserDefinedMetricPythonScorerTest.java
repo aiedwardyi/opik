@@ -5,6 +5,7 @@ import com.comet.opik.api.ScoreSource;
 import com.comet.opik.api.Trace;
 import com.comet.opik.api.evaluators.AutomationRuleEvaluatorTraceThreadUserDefinedMetricPython;
 import com.comet.opik.api.events.TraceThreadToScoreUserDefinedMetricPython;
+import com.comet.opik.api.resources.v1.events.tools.ToolRegistry;
 import com.comet.opik.domain.FeedbackScoreService;
 import com.comet.opik.domain.ProjectService;
 import com.comet.opik.domain.TraceSearchCriteria;
@@ -121,6 +122,10 @@ class OnlineScoringTraceThreadUserDefinedMetricPythonScorerTest {
         when(onlineScoringConfig.getStreams()).thenReturn(List.of(streamConfig));
         when(onlineScoringConfig.getConsumerGroupName()).thenReturn("online_scoring");
 
+        // Real AgenticScoringServiceImpl (not a mock) so the bounded span preload runs for real over the
+        // stubbed spanService.getByTraceIds Flux — toggle-on tests exercise the actual preload path.
+        var agenticScoringService = new AgenticScoringServiceImpl(onlineScoringConfig, new ToolRegistry(Set.of()));
+
         scorer = new OnlineScoringTraceThreadUserDefinedMetricPythonScorer(
                 onlineScoringConfig,
                 serviceTogglesConfig,
@@ -131,7 +136,8 @@ class OnlineScoringTraceThreadUserDefinedMetricPythonScorerTest {
                 traceThreadService,
                 projectService,
                 automationRuleEvaluatorService,
-                spanService);
+                spanService,
+                agenticScoringService);
 
         projectId = UUID.randomUUID();
         ruleId = UUID.randomUUID();
@@ -261,6 +267,7 @@ class OnlineScoringTraceThreadUserDefinedMetricPythonScorerTest {
                     .build();
 
             when(serviceTogglesConfig.isAgenticToolsEnabled()).thenReturn(true);
+            when(onlineScoringConfig.getAgenticToolsMaxPreloadBytes()).thenReturn(64L * 1024 * 1024);
             when(traceService.search(anyInt(), any(TraceSearchCriteria.class)))
                     .thenReturn(Flux.just(trace), Flux.empty());
             when(spanService.getByTraceIds(Set.of(trace.id()))).thenReturn(Flux.just(toolSpan));

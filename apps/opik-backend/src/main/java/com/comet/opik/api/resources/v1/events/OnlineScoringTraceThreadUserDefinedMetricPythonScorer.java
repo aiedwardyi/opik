@@ -62,6 +62,7 @@ public class OnlineScoringTraceThreadUserDefinedMetricPythonScorer
     private final ProjectService projectService;
     private final AutomationRuleEvaluatorService automationRuleEvaluatorService;
     private final SpanService spanService;
+    private final AgenticScoringService agenticScoringService;
 
     @Inject
     public OnlineScoringTraceThreadUserDefinedMetricPythonScorer(
@@ -74,7 +75,8 @@ public class OnlineScoringTraceThreadUserDefinedMetricPythonScorer
             @NonNull TraceThreadService traceThreadService,
             @NonNull ProjectService projectService,
             @NonNull AutomationRuleEvaluatorService automationRuleEvaluatorService,
-            @NonNull SpanService spanService) {
+            @NonNull SpanService spanService,
+            @NonNull AgenticScoringService agenticScoringService) {
         super(config, redisson, feedbackScoreService, traceService, TRACE_THREAD_USER_DEFINED_METRIC_PYTHON,
                 Constants.TRACE_THREAD_USER_DEFINED_METRIC_PYTHON);
         this.pythonEvaluatorService = pythonEvaluatorService;
@@ -83,6 +85,7 @@ public class OnlineScoringTraceThreadUserDefinedMetricPythonScorer
         this.projectService = projectService;
         this.automationRuleEvaluatorService = automationRuleEvaluatorService;
         this.spanService = spanService;
+        this.agenticScoringService = agenticScoringService;
         this.userFacingLogger = UserFacingLoggingFactory
                 .getLogger(OnlineScoringTraceThreadUserDefinedMetricPythonScorer.class);
     }
@@ -208,29 +211,42 @@ public class OnlineScoringTraceThreadUserDefinedMetricPythonScorer
      */
     private Mono<Void> scoreThread(TraceThreadToScoreUserDefinedMetricPython message, List<Trace> traces,
             UUID threadModelId, String threadId, AutomationRuleEvaluator<?, ?> rule, Map<String, String> mdc) {
-        // Fetch every span across every trace in the thread when the agentic-tools feature
-        // flag is on — same gate as the LLM-as-judge thread scorer. Spans get nested under
-        // their trace's assistant ChatMessage via fromTraceToThreadEnriched, so the user's
-        // Python `score(...)` method sees the full call tree (tool inputs/outputs + LLM
-        // calls) instead of the legacy {role, content}-only shape. When the toggle is off,
-        // empty spans → ChatMessage's `spans` field omitted via @JsonInclude(NON_NULL) →
-        // wire-identical to today's [{role, content}, ...].
-        Mono<List<Span>> spansMono = serviceTogglesConfig.isAgenticToolsEnabled()
-                ? spanService.getByTraceIds(traces.stream().map(Trace::id).collect(Collectors.toSet()))
-                        .collectList()
+        // Preload the thread's spans when the agentic-tools feature flag is on — same enrichment as
+        // the LLM-as-judge thread scorer: spans get nested under their trace's assistant ChatMessage
+        // via fromTraceToThreadEnriched, so the user's Python `score(...)` method sees the full call
+        // tree (tool inputs/outputs + LLM calls) instead of the legacy {role, content}-only shape.
+        // Unlike the LLM scorer this path has no inline-vs-tools routing, so we bound the preload to a
+        // hard heap cap (agenticToolsMaxPreloadBytes): a thread that exceeds it degrades to the
+        // unenriched shape rather than buffering every span of every trace in heap (GBs on large
+        // agentic threads) and OOM-crashing the JVM (OPIK-7454). When the toggle is off, empty spans →
+        // ChatMessage's `spans` field omitted via @JsonInclude(NON_NULL) → wire-identical to today's
+        // [{role, content}, ...].
+        Mono<AgenticScoringService.ThreadSpanPreload> spansMono = serviceTogglesConfig.isAgenticToolsEnabled()
+                ? agenticScoringService.preloadThreadSpansBounded(
+                        spanService.getByTraceIds(traces.stream().map(Trace::id).collect(Collectors.toSet())),
+                        onlineScoringConfig.getAgenticToolsMaxPreloadBytes())
                         .contextWrite(ctx -> ctx
                                 .put(RequestContext.WORKSPACE_ID, message.workspaceId())
                                 .put(RequestContext.USER_NAME, message.userName()))
-                : Mono.just(List.of());
+                : Mono.just(AgenticScoringService.ThreadSpanPreload.empty());
         return spansMono
                 // boundedElastic so the blocking JDBC call inside prepareScoring
                 // (projectService.get) doesn't pin the upstream thread — could be the consumer
-                // loop when spansMono is Mono.just(empty), or the spanService DB thread when
-                // spansMono is the getByTraceIds fetch. Either way, blocking on those threads
-                // is bad; boundedElastic is the standard pick for wrapping blocking calls in a
-                // reactive chain.
-                .flatMap(spans -> Mono.fromCallable(
-                        () -> prepareScoring(message, traces, spans, threadId, rule, mdc))
+                // loop when the preload is empty, or the spanService DB thread when it is the
+                // getByTraceIds fetch. Either way, blocking on those threads is bad; boundedElastic
+                // is the standard pick for wrapping blocking calls in a reactive chain.
+                .flatMap(preload -> Mono.fromCallable(() -> {
+                    if (preload.overflowed()) {
+                        try (var logContext = wrapWithMdc(mdc)) {
+                            userFacingLogger.warn(
+                                    "Thread '{}' exceeds the '{}'-byte span-enrichment cap for agentic tools;"
+                                            + " scoring with the unenriched context (no per-turn span tree)."
+                                            + " Reduce the thread size or raise onlineScoring.agenticToolsMaxPreloadBytes.",
+                                    threadId, onlineScoringConfig.getAgenticToolsMaxPreloadBytes());
+                        }
+                    }
+                    return prepareScoring(message, traces, preload.spans(), threadId, rule, mdc);
+                })
                         .subscribeOn(Schedulers.boundedElastic()))
                 .flatMap(context -> evaluateAndStore(message, threadModelId, threadId, context, mdc))
                 .doOnError(withMdc(mdc, error -> userFacingLogger
